@@ -31,6 +31,8 @@ import hashlib
 import json
 import math
 import os
+import random
+import signal
 import struct
 import subprocess
 import sys
@@ -354,6 +356,7 @@ class RSAPublicKey(object):
     modulus: The key modulus.
     num_bits: The key size.
     key_path: The path to a key file.
+    key_password: The password to a key file or unset.
   """
 
   MODULUS_PREFIX = b'modulus='
@@ -367,6 +370,16 @@ class RSAPublicKey(object):
     Raises:
       AvbError: If RSA key parameters could not be read from file.
     """
+    # Read key password from ANDROID_SECURE_STORAGE_CMD
+    if secure_storage_cmd := os.getenv('ANDROID_SECURE_STORAGE_CMD', None):
+      os.environ['TMP__KEY_FILE_NAME'] = str(key_path)
+      p = subprocess.Popen(secure_storage_cmd, shell=True, stdout=subprocess.PIPE)
+      pout, _ = p.communicate()
+      if p.returncode == 0:
+        self.key_password = pout.decode('utf-8')
+      else:
+        print('Failed to get password for key', key_path)
+
     # We used to have something as simple as this:
     #
     #  key = Crypto.PublicKey.RSA.importKey(open(key_path).read())
@@ -378,6 +391,8 @@ class RSAPublicKey(object):
     # instead just parse openssl(1) output to get this
     # information. It's ugly but...
     args = ['openssl', 'rsa', '-in', key_path, '-modulus', '-noout']
+    if key_password := getattr(self, 'key_password', None):
+      args += ['--passin', 'pass:' + key_password]
     p = subprocess.Popen(args,
                          stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE,
@@ -491,8 +506,11 @@ class RSAPublicKey(object):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE)
       else:
+        args = ['openssl', 'rsautl', '-sign', '-inkey', self.key_path, '-raw']
+        if key_password := getattr(self, 'key_password', None):
+          args += ['--passin', 'pass:' + key_password]
         p = subprocess.Popen(
-            ['openssl', 'rsautl', '-sign', '-inkey', self.key_path, '-raw'],
+            args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE)
@@ -4094,7 +4112,7 @@ def calc_fec_data_size(image_size, num_roots):
   return int(pout)
 
 
-def generate_fec_data(image_filename, num_roots):
+def generate_fec_data(image_filename, num_roots, attempt=1):
   """Generate FEC codes for an image.
 
   Arguments:
@@ -4114,6 +4132,11 @@ def generate_fec_data(image_filename, num_roots):
            fec_tmpfile.name],
           stderr=open(os.devnull, 'wb'))
     except subprocess.CalledProcessError as e:
+      if attempt < 3 and e.returncode == -signal.SIGKILL:
+        seconds = random.randrange(30, 120)
+        print('avbtool: fec died, retrying in', seconds, 'seconds')
+        time.sleep(seconds)
+        return generate_fec_data(image_filename, num_roots, attempt + 1)
       raise ValueError('Execution of \'fec\' tool failed: {}.'
                        .format(e)) from e
     fec_data = fec_tmpfile.read()
